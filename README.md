@@ -1,6 +1,8 @@
 # zdoc
 
-![zdoc logo](assets/icons/zdoc.png)
+<p align="center">
+  <img src="assets/icons/zdoc.png" width="175" alt="zdoc logo">
+</p>
 
 [![Built with Zig](https://img.shields.io/badge/built%20with-Zig-yellow?logo=zig)](https://ziglang.org/)
 [![Zig](https://img.shields.io/badge/zig-0.16.0--dev-orange?logo=zig)](https://ziglang.org/)
