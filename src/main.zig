@@ -10,17 +10,20 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 3) {
-        std.debug.print("Usage: zdoc <input.zig> <output_dir>\n", .{});
+        std.debug.print("Usage: zdoc <input_file_or_dir> <output_dir>\n", .{});
+        std.debug.print("       zdoc file1.zig file2.zig ... <output_dir>\n", .{});
         return error.InvalidArguments;
     }
 
-    const input_file = args[1];
-    const output_dir = args[2];
+    const output_dir = args[args.len - 1];
+    const inputs = args[1..args.len - 1];
 
-    // For now, just print
-    std.debug.print("Input: {s}, Output: {s}\n", .{ input_file, output_dir });
+    std.debug.print("Output directory: {s}\n", .{output_dir});
+    for (inputs) |input| {
+        std.debug.print("Input: {s}\n", .{input});
+    }
 
-    try zdoc.generateDocs(allocator, input_file, output_dir);
+    try zdoc.generateDocsMultiple(allocator, inputs, output_dir);
 }
 
 test "simple test" {
