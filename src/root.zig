@@ -1,11 +1,17 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
+const markdown = @import("markdown.zig");
 
 fn extractFunctionSignature(ast: *std.zig.Ast, fn_proto: std.zig.Ast.full.FnProto, buffer: []u8) ![]const u8 {
     _ = ast;
-    // For now, return basic parameter count info
+    // Enhanced parameter count info for now - full signature parsing is complex
     const param_count = fn_proto.ast.params.len;
-    return try std.fmt.bufPrint(buffer, "({d} parameters)", .{param_count});
+
+    if (param_count == 0) {
+        return try std.fmt.bufPrint(buffer, "()", .{});
+    } else {
+        return try std.fmt.bufPrint(buffer, "({d} parameter{s})", .{ param_count, if (param_count == 1) "" else "s" });
+    }
 }
 
 fn extractDocComment(ast: *std.zig.Ast, token_idx: std.zig.Ast.TokenIndex, allocator: std.mem.Allocator) !?[]const u8 {
@@ -155,7 +161,21 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
     };
 
     var declarations = std.ArrayListUnmanaged(Declaration){};
-    defer declarations.deinit(allocator);
+    defer {
+        // Free all doc comments and signatures before deinitializing declarations
+        for (declarations.items) |decl| {
+            if (decl.doc_comment) |doc| {
+                allocator.free(doc);
+            }
+            // Free signature if it was allocated (generic functions)
+            if (decl.signature) |sig| {
+                if (std.mem.indexOf(u8, sig, "<generic>") != null) {
+                    allocator.free(sig);
+                }
+            }
+        }
+        declarations.deinit(allocator);
+    }
 
     for (ast.rootDecls()) |decl_idx| {
         const idx = @intFromEnum(decl_idx);
@@ -173,11 +193,32 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
 
                 // Extract doc comment
                 const doc_comment = try extractDocComment(&ast, main_token, allocator);
+                errdefer if (doc_comment) |doc| allocator.free(doc);
+
+                // Check if this is a generic function by looking for 'comptime' parameters
+                var is_generic = false;
+                if (fn_proto) |proto| {
+                    for (proto.ast.params) |param_node| {
+                        const param_token = ast.nodes.items(.main_token)[@intFromEnum(param_node)];
+                        const param_text = ast.tokenSlice(param_token);
+                        if (std.mem.eql(u8, param_text, "comptime")) {
+                            is_generic = true;
+                            break;
+                        }
+                    }
+                }
 
                 if (fn_proto) |proto| {
                     var sig_buffer: [256]u8 = undefined;
                     const sig = try extractFunctionSignature(&ast, proto, sig_buffer[0..]);
-                    try declarations.append(allocator, .{ .name = name, .kind = .function, .signature = sig, .doc_comment = doc_comment });
+
+                    // Add generic indicator
+                    if (is_generic) {
+                        const generic_sig = try std.fmt.allocPrint(allocator, "{s} <generic>", .{sig});
+                        try declarations.append(allocator, .{ .name = name, .kind = .function, .signature = generic_sig, .doc_comment = doc_comment });
+                    } else {
+                        try declarations.append(allocator, .{ .name = name, .kind = .function, .signature = sig, .doc_comment = doc_comment });
+                    }
                 } else {
                     try declarations.append(allocator, .{ .name = name, .kind = .function, .doc_comment = doc_comment });
                 }
@@ -188,6 +229,7 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
 
                 // Extract doc comment
                 const doc_comment = try extractDocComment(&ast, main_token, allocator);
+                errdefer if (doc_comment) |doc| allocator.free(doc);
 
                 try declarations.append(allocator, .{ .name = name, .kind = .variable, .doc_comment = doc_comment });
             },
@@ -218,6 +260,7 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
 
                 // Extract doc comment
                 const doc_comment = try extractDocComment(&ast, main_token, allocator);
+                errdefer if (doc_comment) |doc| allocator.free(doc);
 
                 try declarations.append(allocator, .{ .name = name, .kind = kind, .doc_comment = doc_comment });
             },
@@ -261,6 +304,15 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
         \\.kind {{ color: #666; font-size: 0.8em; text-transform: uppercase; }}
         \\.signature {{ font-family: monospace; color: #333; }}
         \\.doc-comment {{ color: #555; font-style: italic; margin-top: 5px; padding: 5px; background: #f0f0f0; border-radius: 3px; }}
+        \\.code-block {{ background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px; padding: 15px; margin: 10px 0; overflow-x: auto; }}
+        \\.code-block code {{ background: none; padding: 0; }}
+        \\.zig-keyword {{ color: #0066cc; font-weight: bold; }}
+        \\.zig-string {{ color: #008800; }}
+        \\.zig-number {{ color: #aa6600; }}
+        \\.zig-comment {{ color: #888888; font-style: italic; }}
+        \\.zig-type {{ color: #0088aa; font-weight: bold; }}
+        \\.zig-function {{ color: #7700aa; }}
+        \\.generic-indicator {{ color: #cc6600; font-weight: bold; font-style: italic; }}
         \\
         \\/* Mobile responsive design */
         \\@media (max-width: 768px) {{
@@ -344,15 +396,28 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
                 , .{ css_classes[kind_idx], decl.name, decl.name, kind_names[kind_idx] })).len;
 
                 if (decl.signature) |sig| {
-                    html_len += (try std.fmt.bufPrint(html_buffer[html_len..],
-                        \\<br><span class="signature">{s}</span>
-                    , .{sig})).len;
+                    // Handle generic indicators with special styling
+                    if (std.mem.indexOf(u8, sig, "<generic>")) |generic_pos| {
+                        const base_sig = sig[0..generic_pos];
+                        html_len += (try std.fmt.bufPrint(html_buffer[html_len..],
+                            \\<br><span class="signature">{s}<span class="generic-indicator">&lt;generic&gt;</span></span>
+                        , .{base_sig})).len;
+                    } else {
+                        html_len += (try std.fmt.bufPrint(html_buffer[html_len..],
+                            \\<br><span class="signature">{s}</span>
+                        , .{sig})).len;
+                    }
                 }
 
                 if (decl.doc_comment) |doc| {
+                    // Parse markdown and convert to HTML
+                    var md_parser = markdown.MarkdownParser.init(allocator);
+                    const parsed_html = md_parser.parseToHtml(doc) catch doc; // fallback to plain text
+                    defer if (parsed_html.ptr != doc.ptr) allocator.free(parsed_html);
+
                     html_len += (try std.fmt.bufPrint(html_buffer[html_len..],
                         \\<br><div class="doc-comment">{s}</div>
-                    , .{doc})).len;
+                    , .{parsed_html})).len;
                 }
 
                 html_len += (try std.fmt.bufPrint(html_buffer[html_len..], "</div>\n", .{})).len;
@@ -383,6 +448,48 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
         \\  sections.forEach(function(section) {{
         \\    const visibleItems = section.querySelectorAll('.nav-item[style*="block"], .nav-item:not([style])');
         \\    section.style.display = (query === '' || visibleItems.length > 0) ? 'block' : 'none';
+        \\  }});
+        \\}});
+        \\
+        \\// Syntax highlighting for Zig code
+        \\function highlightZig(code) {{
+        \\  const keywords = ['const', 'var', 'pub', 'fn', 'struct', 'enum', 'union', 'if', 'else', 'while', 'for', 'return', 'try', 'catch', 'defer', 'errdefer', 'switch', 'and', 'or', 'null', 'undefined', 'true', 'false', 'test', 'comptime', 'inline', 'export', 'extern', 'packed', 'align', 'volatile', 'allowzero', 'async', 'await', 'suspend', 'resume', 'cancel'];
+        \\  const types = ['u8', 'u16', 'u32', 'u64', 'i8', 'i16', 'i32', 'i64', 'f32', 'f64', 'bool', 'usize', 'isize', 'c_short', 'c_ushort', 'c_int', 'c_uint', 'c_long', 'c_ulong', 'c_longlong', 'c_ulonglong', 'c_longdouble', 'c_void', 'void', 'noreturn', 'type', 'anyerror', 'anyframe', 'anytype'];
+        \\
+        \\  let result = code;
+        \\
+        \\  // Highlight strings
+        \\  result = result.replace(/"([^"\\\\]|\\\\.)*"/g, '<span class="zig-string">$&</span>');
+        \\  result = result.replace(/'([^'\\\\]|\\\\.)'/g, '<span class="zig-string">$&</span>');
+        \\
+        \\  // Highlight numbers
+        \\  result = result.replace(/\\b\\d+(\\.\\d+)?\\b/g, '<span class="zig-number">$&</span>');
+        \\
+        \\  // Highlight comments
+        \\  result = result.replace(/\\/\\/.*$/gm, '<span class="zig-comment">$&</span>');
+        \\
+        \\  // Highlight keywords
+        \\  keywords.forEach(function(keyword) {{
+        \\    const regex = new RegExp('\\\\b' + keyword + '\\\\b', 'g');
+        \\    result = result.replace(regex, '<span class="zig-keyword">' + keyword + '</span>');
+        \\  }});
+        \\
+        \\  // Highlight types
+        \\  types.forEach(function(type) {{
+        \\    const regex = new RegExp('\\\\b' + type + '\\\\b', 'g');
+        \\    result = result.replace(regex, '<span class="zig-type">' + type + '</span>');
+        \\  }});
+        \\
+        \\  return result;
+        \\}}
+        \\
+        \\// Apply syntax highlighting on page load
+        \\document.addEventListener('DOMContentLoaded', function() {{
+        \\  const codeBlocks = document.querySelectorAll('code');
+        \\  codeBlocks.forEach(function(block) {{
+        \\    if (block.textContent.includes('const') || block.textContent.includes('fn') || block.textContent.includes('pub')) {{
+        \\      block.innerHTML = highlightZig(block.textContent);
+        \\    }}
         \\  }});
         \\}});
         \\</script>
