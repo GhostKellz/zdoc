@@ -1,0 +1,29 @@
+{
+  "source_file": "test_example.zig",
+  "generated_at": "1758922302",
+  "declarations": [
+    {
+  "name": "std",
+  "kind": "variable"
+},
+    {
+  "name": "Point",
+  "kind": "struct_type",
+  "documentation": "A simple example struct"
+},
+    {
+  "name": "Color",
+  "kind": "enum_type",
+  "documentation": "An example enum"
+},
+    {
+  "name": "add",
+  "kind": "function",
+  "signature": "(2 parameters)"
+},
+    {
+  "name": "test_var",
+  "kind": "variable"
+}
+  ]
+}

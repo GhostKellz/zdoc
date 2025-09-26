@@ -1,0 +1,25 @@
+{
+  "source_file": "test2.zig",
+  "generated_at": "1758923179",
+  "declarations": [
+    {
+  "name": "std",
+  "kind": "variable"
+},
+    {
+  "name": "Math",
+  "kind": "struct_type",
+  "documentation": "A utility struct for mathematical operations"
+},
+    {
+  "name": "Status",
+  "kind": "enum_type",
+  "documentation": "Status enumeration"
+},
+    {
+  "name": "PI",
+  "kind": "variable",
+  "documentation": "Global constant"
+}
+  ]
+}

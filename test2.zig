@@ -11,7 +11,7 @@ const Math = struct {
 /// Status enumeration
 const Status = enum {
     ok,
-    error,
+    err,
     pending,
 };
 

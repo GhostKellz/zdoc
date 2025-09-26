@@ -1,6 +1,12 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
 const markdown = @import("markdown.zig");
+const output = @import("output.zig");
+const cache = @import("cache.zig");
+const performance = @import("performance.zig");
+
+// Re-export types for external use
+pub const OutputFormat = output.OutputFormat;
 
 fn extractFunctionSignature(ast: *std.zig.Ast, fn_proto: std.zig.Ast.full.FnProto, buffer: []u8) ![]const u8 {
     _ = ast;
@@ -82,39 +88,182 @@ pub fn add(a: i32, b: i32) i32 {
     return a + b;
 }
 
-pub fn generateDocsMultiple(allocator: std.mem.Allocator, inputs: []const []const u8, output_dir: []const u8) !void {
+pub fn generateDocsMultiple(allocator: std.mem.Allocator, inputs: []const []const u8, output_dir: []const u8, format: output.OutputFormat) !void {
     // Create output directory
     try std.fs.cwd().makePath(output_dir);
 
-    for (inputs) |input| {
-        const stat = std.fs.cwd().statFile(input) catch |err| switch (err) {
-            error.FileNotFound => {
-                std.debug.print("Error: File not found: {s}\n", .{input});
-                continue;
-            },
-            else => return err,
+    // If there are multiple files, process them in parallel for better performance
+    if (inputs.len <= 1) {
+        // Single file - process normally
+        for (inputs) |input| {
+            try processInput(allocator, input, output_dir, format);
+        }
+    } else {
+        // Multiple files - process in parallel
+        try processInputsParallel(allocator, inputs, output_dir, format);
+    }
+}
+
+fn processInput(allocator: std.mem.Allocator, input: []const u8, output_dir: []const u8, format: output.OutputFormat) !void {
+    const stat = std.fs.cwd().statFile(input) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("Error: File not found: {s}\n", .{input});
+            return;
+        },
+        else => return err,
+    };
+
+    if (stat.kind == .directory) {
+        try processDirectory(allocator, input, output_dir, format);
+    } else {
+        // Generate docs for single file
+        const basename = std.fs.path.basename(input);
+        const name_without_ext = if (std.mem.endsWith(u8, basename, ".zig"))
+            basename[0 .. basename.len - 4]
+        else
+            basename;
+
+        const file_output_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_dir, name_without_ext });
+        defer allocator.free(file_output_dir);
+
+        try generateDocs(allocator, input, file_output_dir, format);
+    }
+}
+
+fn processInputsParallel(allocator: std.mem.Allocator, inputs: []const []const u8, output_dir: []const u8, format: output.OutputFormat) !void {
+    // Simple parallel processing using threads
+    var threads = try allocator.alloc(std.Thread, inputs.len);
+    defer allocator.free(threads);
+
+    const Context = struct {
+        base_allocator: std.mem.Allocator,
+        input: []const u8,
+        output_dir: []const u8,
+        format: output.OutputFormat,
+        error_result: ?anyerror = null,
+
+        fn threadFn(ctx: *@This()) void {
+            // Each thread gets its own arena allocator for safety
+            var arena = std.heap.ArenaAllocator.init(ctx.base_allocator);
+            defer arena.deinit();
+            const thread_allocator = arena.allocator();
+
+            processInput(thread_allocator, ctx.input, ctx.output_dir, ctx.format) catch |err| {
+                ctx.error_result = err;
+            };
+        }
+    };
+
+    var contexts = try allocator.alloc(Context, inputs.len);
+    defer allocator.free(contexts);
+
+    // Start threads
+    for (inputs, 0..) |input, i| {
+        contexts[i] = Context{
+            .base_allocator = allocator,
+            .input = input,
+            .output_dir = output_dir,
+            .format = format,
         };
 
-        if (stat.kind == .directory) {
-            try processDirectory(allocator, input, output_dir);
-        } else {
-            // Generate docs for single file
-            const basename = std.fs.path.basename(input);
-            const name_without_ext = if (std.mem.endsWith(u8, basename, ".zig"))
-                basename[0 .. basename.len - 4]
-            else
-                basename;
+        threads[i] = try std.Thread.spawn(.{}, Context.threadFn, .{&contexts[i]});
+    }
 
-            const file_output_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_dir, name_without_ext });
-            defer allocator.free(file_output_dir);
+    // Wait for all threads to complete
+    for (threads) |thread| {
+        thread.join();
+    }
 
-            try generateDocs(allocator, input, file_output_dir);
+    // Check for errors
+    for (contexts) |ctx| {
+        if (ctx.error_result) |err| {
+            return err;
         }
     }
 }
 
+/// Optimized documentation generation for large projects (10K+ files)
+pub fn generateDocsLargeProject(allocator: std.mem.Allocator, inputs: []const []const u8, output_dir: []const u8, format: output.OutputFormat) !void {
+    var perf = performance.Performance.init(allocator);
+    std.debug.print("Starting large project documentation generation ({d} files)\n", .{inputs.len});
 
-fn processDirectory(allocator: std.mem.Allocator, dir_path: []const u8, output_dir: []const u8) !void {
+    // Create output directory
+    try std.fs.cwd().makePath(output_dir);
+
+    // Use batch processing for large projects to optimize memory usage
+    const optimal_batch_size = if (inputs.len > 1000) 50 else if (inputs.len > 100) 20 else 10;
+    var batch_processor = performance.BatchProcessor.init(allocator, optimal_batch_size);
+
+    const BatchContext = struct {
+        output_dir: []const u8,
+        format: output.OutputFormat,
+    };
+
+    const batch_ctx = BatchContext{
+        .output_dir = output_dir,
+        .format = format,
+    };
+
+    const processBatchFn = struct {
+        fn processBatch(batch_allocator: std.mem.Allocator, files: []const []const u8) anyerror!void {
+            // Process each file in the batch with thread safety
+            var threads = try batch_allocator.alloc(std.Thread, files.len);
+            defer batch_allocator.free(threads);
+
+            const Context = struct {
+                base_allocator: std.mem.Allocator,
+                input: []const u8,
+                output_dir: []const u8,
+                format: output.OutputFormat,
+                error_result: ?anyerror = null,
+
+                fn threadFn(ctx: *@This()) void {
+                    var arena = std.heap.ArenaAllocator.init(ctx.base_allocator);
+                    defer arena.deinit();
+                    const thread_allocator = arena.allocator();
+
+                    processInput(thread_allocator, ctx.input, ctx.output_dir, ctx.format) catch |err| {
+                        ctx.error_result = err;
+                    };
+                }
+            };
+
+            var contexts = try batch_allocator.alloc(Context, files.len);
+            defer batch_allocator.free(contexts);
+
+            // Start threads for this batch
+            for (files, 0..) |input, i| {
+                contexts[i] = Context{
+                    .base_allocator = batch_allocator,
+                    .input = input,
+                    .output_dir = batch_ctx.output_dir,
+                    .format = batch_ctx.format,
+                };
+
+                threads[i] = try std.Thread.spawn(.{}, Context.threadFn, .{&contexts[i]});
+            }
+
+            // Wait for all threads in this batch to complete
+            for (threads) |thread| {
+                thread.join();
+            }
+
+            // Check for errors in this batch
+            for (contexts) |ctx| {
+                if (ctx.error_result) |err| {
+                    return err;
+                }
+            }
+        }
+    }.processBatch;
+
+    try batch_processor.processBatches(inputs, &processBatchFn);
+
+    perf.printStats(inputs.len);
+}
+
+
+fn processDirectory(allocator: std.mem.Allocator, dir_path: []const u8, output_dir: []const u8, format: output.OutputFormat) !void {
     var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
     defer dir.close();
 
@@ -128,39 +277,55 @@ fn processDirectory(allocator: std.mem.Allocator, dir_path: []const u8, output_d
             const file_output_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_dir, name_without_ext });
             defer allocator.free(file_output_dir);
 
-            try generateDocs(allocator, full_path, file_output_dir);
+            try generateDocs(allocator, full_path, file_output_dir, format);
         }
     }
 }
 
-pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output_dir: []const u8) !void {
+pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output_dir: []const u8, format: output.OutputFormat) !void {
+    return generateDocsWithCache(allocator, input_file, output_dir, format, null);
+}
+
+pub fn generateDocsWithCache(allocator: std.mem.Allocator, input_file: []const u8, output_dir: []const u8, format: output.OutputFormat, doc_cache: ?*cache.Cache) !void {
+    // Create output directory
+    try std.fs.cwd().makePath(output_dir);
+
+    // Check cache if available
+    const output_filename = switch (format) {
+        .html => "index.html",
+        .json => "api.json",
+        .markdown_format => "README.md",
+        .pdf => "api.pdf",
+    };
+
+    const output_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_dir, output_filename });
+    defer allocator.free(output_path);
+
+    if (doc_cache) |cache_ptr| {
+        const should_regen = cache_ptr.shouldRegenerate(input_file, output_path) catch true;
+        if (!should_regen) {
+            std.debug.print("Cache hit for {s}, skipping regeneration\n", .{input_file});
+            return;
+        }
+    }
+
     // Read file
     const file = try std.fs.cwd().openFile(input_file, .{});
     defer file.close();
-    const max_size = 1024 * 1024; // 1MB
-    var buffer = try allocator.alloc(u8, max_size);
-    defer allocator.free(buffer);
-    const bytes_read = try file.readAll(buffer);
-    const source = try allocator.allocSentinel(u8, bytes_read, 0);
+    const file_size = try file.getEndPos();
+
+    // Allocate exact size needed with null sentinel
+    const source = try allocator.allocSentinel(u8, file_size, 0);
     defer allocator.free(source);
-    std.mem.copyForwards(u8, source, buffer[0..bytes_read]);
+    _ = try file.readAll(source);
 
     // Parse AST
     var ast = try std.zig.Ast.parse(allocator, source, .zig);
     defer ast.deinit(allocator);
 
-    // Create output directory
-    try std.fs.cwd().makePath(output_dir);
+    // Use the shared Declaration type from output.zig
 
-    // Extract declarations
-    const Declaration = struct {
-        name: []const u8,
-        kind: enum { function, variable, struct_type, enum_type, union_type },
-        signature: ?[]const u8 = null,
-        doc_comment: ?[]const u8 = null,
-    };
-
-    var declarations = std.ArrayListUnmanaged(Declaration){};
+    var declarations = std.ArrayListUnmanaged(output.Declaration){};
     defer {
         // Free all doc comments and signatures before deinitializing declarations
         for (declarations.items) |decl| {
@@ -239,7 +404,7 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
 
                 // Look ahead to see if this is a type declaration
                 var token_idx = name_token + 1;
-                var kind: @TypeOf(@as(Declaration, undefined).kind) = .variable;
+                var kind: @TypeOf(@as(output.Declaration, undefined).kind) = .variable;
 
                 while (token_idx < ast.tokens.len and token_idx < name_token + 15) : (token_idx += 1) {
                     const token = ast.tokenSlice(token_idx);
@@ -268,6 +433,19 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
         }
     }
 
+    // Use the new output system
+    if (format == .html) {
+        // Generate HTML (existing implementation)
+        try generateHtmlOutput(allocator, declarations.items, input_file, output_path);
+    } else {
+        // Use new output system for JSON and Markdown with the cached output_path
+        const generator = output.OutputGenerator.init(allocator, format);
+        try generator.generateOutput(declarations.items, input_file, output_path);
+        return;
+    }
+}
+
+fn generateHtmlOutput(allocator: std.mem.Allocator, declarations: []output.Declaration, input_file: []const u8, output_path: []const u8) !void {
     // Generate HTML
     var html_buffer: [16384]u8 = undefined;
     var html_len: usize = 0;
@@ -349,14 +527,14 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
 
     // Group by kind
     const kind_names = [_][]const u8{ "Functions", "Structs", "Enums", "Unions", "Variables" };
-    const kinds = [_]@TypeOf(declarations.items[0].kind){ .function, .struct_type, .enum_type, .union_type, .variable };
+    const kinds = [_]@TypeOf(declarations[0].kind){ .function, .struct_type, .enum_type, .union_type, .variable };
     const css_classes = [_][]const u8{ "function", "struct", "enum", "union", "variable" };
     const nav_classes = [_][]const u8{ "nav-function", "nav-struct", "nav-enum", "nav-union", "nav-variable" };
 
     // Generate sidebar navigation
     for (kinds, 0..) |kind, kind_idx| {
         var has_nav_items = false;
-        for (declarations.items) |decl| {
+        for (declarations) |decl| {
             if (decl.kind == kind) {
                 if (!has_nav_items) {
                     html_len += (try std.fmt.bufPrint(html_buffer[html_len..],
@@ -384,7 +562,7 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
 
     for (kinds, 0..) |kind, kind_idx| {
         var has_items = false;
-        for (declarations.items) |decl| {
+        for (declarations) |decl| {
             if (decl.kind == kind) {
                 if (!has_items) {
                     html_len += (try std.fmt.bufPrint(html_buffer[html_len..], "<h2>{s}</h2>\n", .{kind_names[kind_idx]})).len;
@@ -498,8 +676,6 @@ pub fn generateDocs(allocator: std.mem.Allocator, input_file: []const u8, output
     , .{})).len;
 
     // Write to file
-    const output_path = try std.fmt.allocPrint(allocator, "{s}/index.html", .{output_dir});
-    defer allocator.free(output_path);
     const out_file = try std.fs.cwd().createFile(output_path, .{});
     defer out_file.close();
     try out_file.writeAll(html_buffer[0..html_len]);

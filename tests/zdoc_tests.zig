@@ -13,7 +13,7 @@ test "basic documentation generation" {
     // Clean output directory
     std.fs.cwd().deleteTree(output_dir) catch {};
 
-    try zdoc.generateDocs(allocator, test_file, output_dir);
+    try zdoc.generateDocs(allocator, test_file, output_dir, .html);
 
     // Verify output file exists
     const output_file = try std.fmt.allocPrint(allocator, "{s}/index.html", .{output_dir});
@@ -50,7 +50,7 @@ test "multiple file documentation generation" {
     // Clean output directory
     std.fs.cwd().deleteTree(output_dir) catch {};
 
-    try zdoc.generateDocsMultiple(allocator, &inputs, output_dir);
+    try zdoc.generateDocsMultiple(allocator, &inputs, output_dir, .html);
 
     // Verify both output directories exist
     var dir = try std.fs.cwd().openDir(output_dir, .{});
@@ -76,7 +76,7 @@ test "doc comment extraction" {
     // Clean output directory
     std.fs.cwd().deleteTree(output_dir) catch {};
 
-    try zdoc.generateDocs(allocator, test_file, output_dir);
+    try zdoc.generateDocs(allocator, test_file, output_dir, .html);
 
     // Read generated HTML
     const output_file = try std.fmt.allocPrint(allocator, "{s}/index.html", .{output_dir});
@@ -105,8 +105,16 @@ test "error handling for non-existent files" {
     const inputs = [_][]const u8{"nonexistent.zig"};
     const output_dir = "tests/output/error_test";
 
-    // This should not crash, but handle the error gracefully
-    try zdoc.generateDocsMultiple(allocator, &inputs, output_dir);
+    // This should handle the error gracefully and not crash
+    // The function will print an error message but continue processing
+    try zdoc.generateDocsMultiple(allocator, &inputs, output_dir, .html);
+
+    // Verify output directory was created even though input file didn't exist
+    var dir = std.fs.cwd().openDir(output_dir, .{}) catch |err| switch (err) {
+        error.FileNotFound => return, // This is acceptable
+        else => return err,
+    };
+    defer dir.close();
 }
 
 test "empty file handling" {
@@ -123,7 +131,7 @@ test "empty file handling" {
     const output_dir = "tests/output/empty_test";
     std.fs.cwd().deleteTree(output_dir) catch {};
 
-    try zdoc.generateDocs(allocator, empty_file, output_dir);
+    try zdoc.generateDocs(allocator, empty_file, output_dir, .html);
 
     // Verify output file exists even for empty input
     const output_file = try std.fmt.allocPrint(allocator, "{s}/index.html", .{output_dir});
